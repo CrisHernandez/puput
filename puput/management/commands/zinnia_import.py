@@ -1,25 +1,36 @@
 # -*- coding: utf-8 -*-
 import os
+import lxml.html
+
 from django import VERSION as DJANGO_VERSION
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import BaseCommand
 from django.conf import settings
 from django.core.files import File
 from wagtail.wagtailcore.models import Page, Site
-from puput.models import Category as PuputCategory
-from puput.models import CategoryEntryPage as PuputCategoryEntryPage
-from zinnia.models import Category as ZinniaCategory
-from zinnia.models import Entry as ZinniaEntry
-from puput.models import EntryPage
-from puput.models import TagEntryPage as PuputTagEntryPage
-from puput.models import Tag as PuputTag
 from wagtail.wagtailimages.models import Image as WagtailImage
+try:
+    from zinnia.models import Category as ZinniaCategory, Entry as ZinniaEntry
+except:
+    raise ImportError("Zinnia must be installed in order to import the blog data")
+
+
+from puput.models import BlogPage, EntryPage, TagEntryPage as PuputTagEntryPage, Tag as PuputTag, \
+    Category as PuputCategory, CategoryEntryPage as PuputCategoryEntryPage
 
 
 class Command(BaseCommand):
-    help = "Load Puput data from zinnia blog app"
+    help = "Import blog data from Zinnia"
+
+    def add_arguments(self, parser):
+        parser.add_argument('blog_slug', default='blog', type=str)
 
     def handle(self, *args, **options):
+        self.get_blog_page(options['blog_slug'])
+        self.import_categories()
+        self.import_entries()
+
+    def get_blog_page(self, slug):
         # Get blogpage content type
         blogpage_content_type, created = ContentType.objects.get_or_create(
             model='blogpage',
@@ -30,93 +41,91 @@ class Command(BaseCommand):
         # Get root page
         rootpage = Page.objects.first()
 
-        # Set site root page as root site page
-        site = Site.objects.first()
-        site.root_page = rootpage
-        site.save()
-
-        # Create example blog page
-        blogpage = Page(
+        # Create blog page
+        self.blogpage = Page(
             title="Blog",
             content_type=blogpage_content_type,
-            slug='blog',
+            slug=slug,
         )
-
-        rootpage.add_child(instance=blogpage)
+        rootpage.add_child(instance=self.blogpage)
         revision = rootpage.save_revision()
         revision.publish()
 
-        print("Importing categories...")
+    def import_categories(self):
+        self.stdout.write("Importing categories...")
         categories = ZinniaCategory.objects.all()
         for category in categories:
-            print("\t%s" % category)
-            new_category, created  = PuputCategory.objects.update_or_create(
+            self.stdout.write("\t{}".format(category))
+            puput_category, created = PuputCategory.objects.update_or_create(
                 name=category.title,
                 slug=category.slug,
                 description=category.description
             )
-            new_category.save()
+            puput_category.save()
 
-        print("Importing entries...")
+    def import_entries(self):
+        self.stdout.write("Importing entries...")
         entries = ZinniaEntry.objects.all()
         for entry in entries:
-
-            print entry.title
-
+            self.stdout.write(entry.title)
             # Header images
             if entry.image:
                 header_image = WagtailImage(file=entry.image, title=os.path.basename(entry.image.url))
-                print('\tImported header image: {}'.format(entry.image))
+                self.stdout.write('\tImported header image: {}'.format(entry.image))
                 header_image.save()
             else:
                 header_image = None
 
-            print('\tGenerate and replace content images....')
-            import lxml.html as LH
-            root = LH.fromstring(entry.content)
+            self.stdout.write('\tGenerate and replace entry content images....')
+            root = lxml.html.fromstring(entry.content)
             for el in root.iter('img'):
-                if  el.attrib['src'].startswith(settings.MEDIA_URL):
+                if el.attrib['src'].startswith(settings.MEDIA_URL):
                     old_image = el.attrib['src'].replace(settings.MEDIA_URL, '')
-                    image_file = open('{}/{}'.format(settings.MEDIA_ROOT, old_image), 'r')
-                    new_image = WagtailImage(file=File(file=image_file, name=os.path.basename(old_image)),
-                                             title=os.path.basename(old_image))
-                    new_image.save()
-                    el.attrib['src'] = new_image.file.url
-                    print '\t\t{}'.format(new_image.file.url)
+                    with open('{}/{}'.format(settings.MEDIA_ROOT, old_image), 'r') as image_file:
+                        new_image = WagtailImage(file=File(file=image_file, name=os.path.basename(old_image)),
+                                                 title=os.path.basename(old_image))
+                        new_image.save()
+                        el.attrib['src'] = new_image.file.url
+                        self.stdout.write('\t\t{}'.format(new_image.file.url))
 
             # New content with images replaced
-            content = LH.tostring(root, pretty_print=True)
+            content = lxml.html.tostring(root, pretty_print=True)
 
             # Create page
             page = EntryPage(
                 title=entry.title,
                 body=content,
                 slug=entry.slug,
-                first_published_at=entry.start_publication,
+                go_live_at=entry.start_publication,
                 expire_at=entry.end_publication,
-                latest_revision_created_at=entry.creation_date,
+                first_published_at=entry.creation_date,
                 date=entry.creation_date,
                 owner=entry.authors.first(),
                 seo_title=entry.title,
+                search_description=entry.excerpt,
                 live=entry.is_visible,
                 header_image=header_image
             )
-
-            blogpage.add_child(instance=page)
-            revision = blogpage.save_revision()
+            self.blogpage.add_child(instance=page)
+            revision = self.blogpage.save_revision()
             revision.publish()
+            self.import_entry_categories(entry, page)
+            self.import_entry_tags(entry, page)
+            page.save()
+            page.save_revision(changed=False)
 
-            print("\tImporting categories...")
-            for category in entry.categories.all():
-                print('\t\tAdd category: %s' % category.title)
-                pc = PuputCategory.objects.get(name=category.title)
-                PuputCategoryEntryPage(category=pc, page=page)
+    def import_entry_categories(self, entry, page):
+        self.stdout.write("\tImporting categories...")
+        for category in entry.categories.all():
+            self.stdout.write('\t\tAdd category: {}'.format(category.title))
+            puput_category = PuputCategory.objects.get(name=category.title)
+            PuputCategoryEntryPage.objects.create(category=puput_category, page=page)
+
+    def import_entry_tags(self, entry, page):
+        self.stdout.write("\tImporting tags...")
+        for tag in entry.tags_list:
+            self.stdout.write('\t\t{}'.format(tag))
+            puput_tag, created = PuputTag.objects.update_or_create(name=tag)
+            page.entry_tags.add(PuputTagEntryPage(tag=puput_tag))
 
 
-            print("\tImporting tags...")
-            for entry_tag in entry.tags_list: # tags de zinnia
-                print('\t\t{}'.format(entry_tag))
-                tag, created = PuputTag.objects.update_or_create(name=entry_tag)
-                page.entry_tags.add(PuputTagEntryPage(tag=tag))
-                page.save()
-                page.save_revision()
