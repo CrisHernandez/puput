@@ -2,8 +2,6 @@
 import os
 import lxml.html
 
-from django import VERSION as DJANGO_VERSION
-from django.contrib.contenttypes.models import ContentType
 from django.core.management import BaseCommand
 from django.conf import settings
 from django.core.files import File
@@ -34,23 +32,21 @@ class Command(BaseCommand):
         self.import_related_entries()
 
     def get_blog_page(self, slug, title):
-        # Get blogpage content type
-        blogpage_content_type, created = ContentType.objects.get_or_create(
-            model='blogpage',
-            app_label='puput',
-            defaults={'name': 'page'} if DJANGO_VERSION < (1, 8) else {}
-        )
-
-        # Get root page
-        rootpage = Page.objects.first()
-
         # Create blog page
         try:
             self.blogpage = BlogPage.objects.get(slug=slug)
         except BlogPage.DoesNotExist:
-            self.blogpage = Page(
+            # Get root page
+            rootpage = Page.objects.first()
+
+            # Set site root page as root site page
+            site = Site.objects.first()
+            site.root_page = rootpage
+            site.save()
+
+            # Get blogpage content type
+            self.blogpage = BlogPage(
                 title=title,
-                content_type=blogpage_content_type,
                 slug=slug,
             )
             rootpage.add_child(instance=self.blogpage)
